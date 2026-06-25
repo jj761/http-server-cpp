@@ -1,3 +1,0 @@
-/home/jithinjacob/projects/http-server-cpp/build/CMakeFiles/http_server.dir
-/home/jithinjacob/projects/http-server-cpp/build/CMakeFiles/edit_cache.dir
-/home/jithinjacob/projects/http-server-cpp/build/CMakeFiles/rebuild_cache.dir
