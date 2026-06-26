@@ -4,6 +4,7 @@
 #include <optional>
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -71,8 +72,15 @@ std::string read_request(int client_fd)
     {
         ssize_t n = recv(client_fd, chunk, sizeof(chunk), 0);
 
-        if (n <= 0)
+        if (n == 0)
             break;
+
+        if (n < 0)
+        {
+            if (errno == EWOULDBLOCK || errno == EAGAIN)
+                std::cerr << "read_request: timed out waiting for headers\n";
+            break;
+        }
 
         buffer.append(chunk, n);
 
@@ -136,6 +144,11 @@ int main()
             std::cerr << "accept() failed\n";
             continue;
         }
+
+        struct timeval timeout;
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
         std::string raw = read_request(client_fd);
         std::cout << raw << "\n";
