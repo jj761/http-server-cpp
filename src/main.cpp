@@ -1,21 +1,65 @@
 #include <iostream>
 #include <string>
 #include <cstring>
+#include <optional>
+#include <algorithm>
+#include <cctype>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
 
-std::string parse_path(const std::string &request)
+std::optional<std::string> parse_path(const std::string &request)
 {
     size_t first_space = request.find(' ');
     if (first_space == std::string::npos)
-        return "/";
+        return std::nullopt;
 
     size_t second_space = request.find(' ', first_space + 1);
     if (second_space == std::string::npos)
-        return "/";
+        return std::nullopt;
 
-    return request.substr(first_space + 1, second_space - first_space - 1);
+    std::string path = request.substr(first_space + 1, second_space - first_space - 1);
+    if (path.empty() || path[0] != '/')
+        return std::nullopt;
+
+    return path;
+}
+
+std::optional<std::string> parse_method(const std::string &request)
+{
+    size_t first_space = request.find(' ');
+    if (first_space == std::string::npos)
+        return std::nullopt;
+
+    return request.substr(0, first_space);
+}
+
+bool has_host_header(const std::string &request)
+{
+    size_t header_end = request.find("\r\n\r\n");
+    std::string headers = (header_end == std::string::npos)
+                              ? request
+                              : request.substr(0, header_end);
+
+    std::transform(headers.begin(), headers.end(), headers.begin(),
+                   [](unsigned char c)
+                   { return std::tolower(c); });
+
+    return headers.find("\r\nhost:") != std::string::npos;
+}
+
+bool has_content_length_header(const std::string &request)
+{
+    size_t header_end = request.find("\r\n\r\n");
+    std::string headers = (header_end == std::string::npos)
+                              ? request
+                              : request.substr(0, header_end);
+
+    std::transform(headers.begin(), headers.end(), headers.begin(),
+                   [](unsigned char c)
+                   { return std::tolower(c); });
+
+    return headers.find("\r\ncontent-length:") != std::string::npos;
 }
 
 std::string read_request(int client_fd)
@@ -96,31 +140,66 @@ int main()
         std::string raw = read_request(client_fd);
         std::cout << raw << "\n";
 
-        std::string path = parse_path(raw);
-        std::cout << "Path: " << path << "\n";
+        auto parsed_path = parse_path(raw);
+        auto parsed_method = parse_method(raw);
 
         std::string body;
         int status_code;
         std::string status_text;
 
-        if (path == "/")
+        if (!parsed_path)
         {
-            body = "<h1>Hello</h1>";
-            status_code = 200;
-            status_text = "OK";
+            body = "<h1>400 Bad Request</h1>";
+            status_code = 400;
+            status_text = "Bad Request";
         }
-        else if (path == "/about")
+        else if (!has_host_header(raw))
         {
-            body = "<h1>About Page</h1>";
-            status_code = 200;
-            status_text = "OK";
+            body = "<h1>400 Bad Request</h1>";
+            status_code = 400;
+            status_text = "Bad Request";
+        }
+        else if (parsed_method &&
+                 *parsed_method != "GET" &&
+                 *parsed_method != "POST" &&
+                 *parsed_method != "HEAD")
+        {
+            body = "<h1>405 Method Not Allowed</h1>";
+            status_code = 405;
+            status_text = "Method Not Allowed";
+        }
+        else if (parsed_method && *parsed_method == "POST" && !has_content_length_header(raw))
+        {
+            body = "<h1>411 Length Required</h1>";
+            status_code = 411;
+            status_text = "Length Required";
         }
         else
         {
-            body = "<h1>404 Not Found</h1>";
-            status_code = 404;
-            status_text = "Not Found";
+            const std::string &path = *parsed_path;
+            std::cout << "Path: " << path << "\n";
+
+            if (path == "/")
+            {
+                body = "<h1>Hello</h1>";
+                status_code = 200;
+                status_text = "OK";
+            }
+            else if (path == "/about")
+            {
+                body = "<h1>About Page</h1>";
+                status_code = 200;
+                status_text = "OK";
+            }
+            else
+            {
+                body = "<h1>404 Not Found</h1>";
+                status_code = 404;
+                status_text = "Not Found";
+            }
         }
+
+        bool is_head = parsed_method && *parsed_method == "HEAD";
 
         std::string response =
             "HTTP/1.1 " + std::to_string(status_code) + " " + status_text + "\r\n"
@@ -128,8 +207,12 @@ int main()
                                                                             "Content-Length: " +
             std::to_string(body.size()) + "\r\n"
                                           "Connection: close\r\n"
-                                          "\r\n" +
-            body;
+                                          "\r\n";
+
+        if (!is_head)
+        {
+            response += body;
+        }
 
         send(client_fd, response.c_str(), response.size(), 0);
         close(client_fd);
