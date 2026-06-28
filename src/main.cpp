@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <fstream>
+#include <filesystem>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -64,6 +66,36 @@ bool has_header(const std::string &request, const std::string &lowercase_name)
                    { return std::tolower(c); });
 
     return headers.find("\r\n" + lowercase_name + ":") != std::string::npos;
+}
+
+// Returns true if `path` ends with `suffix`. std::string::ends_with is
+// C++20; this project is pinned to C++17 (CMakeLists.txt), so it is not
+// available. This is a direct C++17 substitute, not a stylistic choice.
+bool ends_with(const std::string &path, const std::string &suffix)
+{
+    if (suffix.size() > path.size())
+        return false;
+    return path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// Maps a request path's extension to a MIME type for the Content-Type
+// header. Falls back to application/octet-stream for anything
+// unrecognized, which is the correct default for unknown binary data
+// (browsers will offer a download rather than attempt to render it,
+// rather than guessing wrong and rendering garbage as text/html).
+std::string get_mime_type(const std::string &path)
+{
+    if (ends_with(path, ".html"))
+        return "text/html";
+    if (ends_with(path, ".css"))
+        return "text/css";
+    if (ends_with(path, ".js"))
+        return "application/javascript";
+    if (ends_with(path, ".png"))
+        return "image/png";
+    if (ends_with(path, ".jpg") || ends_with(path, ".jpeg"))
+        return "image/jpeg";
+    return "application/octet-stream";
 }
 
 // Attempts to slice exactly one complete HTTP message out of `buffer`.
@@ -153,6 +185,14 @@ std::pair<std::string, ReadStatus> read_request(int client_fd, std::string &left
 
 int main()
 {
+    // Resolved once at startup, not per-request. PROJECT_ROOT is injected
+    // by CMake at compile time (target_compile_definitions, set to
+    // CMAKE_SOURCE_DIR), so this is independent of the working directory
+    // the binary happens to be launched from. See handover doc note on
+    // why executable-relative (/proc/self/exe) resolution was rejected
+    // in favor of compile-time source-tree resolution for this project.
+    const std::string public_dir = std::string(PROJECT_ROOT) + "/public";
+
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0)
     {
@@ -234,6 +274,7 @@ int main()
             std::string body;
             int status_code;
             std::string status_text;
+            std::string content_type = "text/html"; // default; overridden for static files
 
             if (!request_line)
             {
@@ -280,9 +321,51 @@ int main()
                 }
                 else
                 {
-                    body = "<h1>404 Not Found</h1>";
-                    status_code = 404;
-                    status_text = "Not Found";
+                    // Static file serving fallback. Reached only for paths
+                    // that are not one of the hardcoded routes above.
+                    //
+                    // Traversal guard runs on the raw request path, before
+                    // any disk path is constructed, and before the
+                    // filesystem is touched at all. This is deliberate:
+                    // correctness here must not depend on the OS refusing
+                    // to open a path that escapes public_dir; it depends
+                    // on never constructing or opening that path in the
+                    // first place. Rejects "/foo..bar.html" too (a literal
+                    // ".." substring in an otherwise normal filename) as a
+                    // false positive; that tradeoff is accepted as the
+                    // conservative side to err on.
+                    if (path.find("..") != std::string::npos)
+                    {
+                        body = "<h1>400 Bad Request</h1>";
+                        status_code = 400;
+                        status_text = "Bad Request";
+                    }
+                    else
+                    {
+                        // path already starts with '/' (enforced by
+                        // parse_request_line), so this concatenation does
+                        // not need an extra separator.
+                        std::string disk_path = public_dir + path;
+
+                        std::ifstream file(disk_path, std::ios::binary);
+                        if (!file)
+                        {
+                            // Distinct from the hardcoded route-not-found
+                            // 404 above: this means "no such file on disk
+                            // under public_dir", not "no such route".
+                            body = "<h1>404 File Not Found</h1>";
+                            status_code = 404;
+                            status_text = "Not Found";
+                        }
+                        else
+                        {
+                            body.assign((std::istreambuf_iterator<char>(file)),
+                                        std::istreambuf_iterator<char>());
+                            status_code = 200;
+                            status_text = "OK";
+                            content_type = get_mime_type(path);
+                        }
+                    }
                 }
             }
 
@@ -319,8 +402,9 @@ int main()
 
             std::string response =
                 "HTTP/1.1 " + std::to_string(status_code) + " " + status_text + "\r\n"
-                                                                                "Content-Type: text/html\r\n"
-                                                                                "Content-Length: " +
+                                                                                "Content-Type: " +
+                content_type + "\r\n"
+                               "Content-Length: " +
                 std::to_string(body.size()) + "\r\n"
                                               "Connection: " +
                 (should_close ? "close" : "keep-alive") + "\r\n"
