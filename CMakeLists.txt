@@ -3,3 +3,6 @@ project(http_server)
 set(CMAKE_CXX_STANDARD 17)
 add_executable(http_server src/main.cpp)
 target_compile_definitions(http_server PRIVATE PROJECT_ROOT="${CMAKE_SOURCE_DIR}")
+
+find_package(Threads REQUIRED)
+target_link_libraries(http_server PRIVATE Threads::Threads)

@@ -7,6 +7,13 @@
 #include <cerrno>
 #include <fstream>
 #include <filesystem>
+#include <thread>
+#include <vector>
+#include <queue>
+#include <functional>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -183,15 +190,344 @@ std::pair<std::string, ReadStatus> read_request(int client_fd, std::string &left
     }
 }
 
+// ---------------------------------------------------------------------
+// ThreadPool
+//
+// Fixed-size worker pool with a bounded task queue. NEW as of Week 2 /
+// Day 6. Design decisions (see handover doc for full reasoning, this is
+// the short version):
+//   - Fixed thread count, chosen at construction (main() passes
+//     hardware_concurrency()). Not auto-scaling. This server's work is
+//     I/O-bound (blocking on recv/send), so hardware_concurrency() is a
+//     starting point to benchmark from, not a proven-optimal number.
+//   - Bounded queue, not unbounded. An unbounded queue under sustained
+//     overload just relocates the unbounded-growth problem thread-per-
+//     connection had (too many threads) into "too many queued tasks
+//     sitting in memory." A cap forces an explicit decision about what
+//     happens when the server is overloaded, instead of letting memory
+//     grow silently.
+//   - try_submit() returns false on a full queue rather than blocking
+//     the accept loop or throwing. main() uses this return value to
+//     decide whether to send a 503 Service Unavailable before closing
+//     the connection, rather than accepting unbounded backlog.
+//   - Condition variable wait uses the standard lambda-predicate form
+//     specifically to guard against spurious wakeups (a real, documented
+//     hazard of cv.wait() with no predicate: the OS is permitted to wake
+//     a waiting thread with no corresponding notify_*() call, so the
+//     wait must always re-check its actual condition after waking, not
+//     assume a wakeup implies the condition is true).
+class ThreadPool
+{
+public:
+    explicit ThreadPool(size_t thread_count, size_t max_queue_size)
+        : max_queue_size_(max_queue_size), shutdown_(false)
+    {
+        // Guard against hardware_concurrency() returning 0, which the
+        // standard permits when the value cannot be determined. A pool
+        // of zero threads would silently accept tasks that are never
+        // run, which is a much worse failure mode than just picking a
+        // safe minimum.
+        if (thread_count == 0)
+            thread_count = 1;
+
+        for (size_t i = 0; i < thread_count; ++i)
+            workers_.emplace_back([this]
+                                  { worker_loop(); });
+    }
+
+    // Attempts to enqueue a task. Returns false (and does NOT enqueue)
+    // if the queue is already at max_queue_size_. The caller (main())
+    // is responsible for deciding what to do on rejection; this class
+    // has no knowledge of HTTP, sockets, or 503 responses.
+    bool try_submit(std::function<void()> task)
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        if (task_queue_.size() >= max_queue_size_)
+            return false;
+        task_queue_.push(std::move(task));
+        lock.unlock();
+        cv_.notify_one();
+        return true;
+    }
+
+    // Signals all worker threads to stop after finishing any currently
+    // queued tasks, then joins them. Not currently called anywhere in
+    // main() (the server runs until killed), but provided for
+    // correctness and so the destructor has well-defined behavior if
+    // the pool is ever destroyed while threads are running (e.g. in a
+    // future test harness).
+    ~ThreadPool()
+    {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            shutdown_ = true;
+        }
+        cv_.notify_all();
+        for (auto &t : workers_)
+            t.join();
+    }
+
+private:
+    void worker_loop()
+    {
+        while (true)
+        {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                cv_.wait(lock, [this]
+                         { return !task_queue_.empty() || shutdown_; });
+
+                if (shutdown_ && task_queue_.empty())
+                    return;
+
+                task = std::move(task_queue_.front());
+                task_queue_.pop();
+            } // lock released here, before running the task
+
+            task(); // executed outside the lock
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> task_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable cv_;
+    size_t max_queue_size_;
+    bool shutdown_;
+};
+
+// ---------------------------------------------------------------------
+// handle_connection
+//
+// NEW as of Week 2 / Day 6: this is the entire per-connection block that
+// used to live inline in main()'s accept loop, relocated verbatim into
+// its own function so it can be handed to the thread pool as a task.
+// The keep-alive logic, request parsing, routing, and static file
+// serving inside this function are UNCHANGED from the Day 5 version;
+// only the surrounding location moved. public_dir is taken by value
+// (see handover doc Day 6 section for why: it's a small, immutable
+// string, and by-value capture removes any cross-thread lifetime
+// question entirely, at negligible copy cost).
+void handle_connection(int client_fd, std::string public_dir)
+{
+    struct timeval timeout;
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    // Per-connection state. Declared here, outside the keep-alive loop,
+    // so it persists across multiple requests on the same connection.
+    std::string leftover;
+
+    while (true) // keep-alive loop: one iteration per request
+    {
+        auto [raw, status] = read_request(client_fd, leftover);
+
+        if (status == ReadStatus::ClientClosed)
+            break; // peer already closed, nothing to send, tear down
+
+        if (status == ReadStatus::TimedOut)
+        {
+            // Send 408 before closing. Best-effort: the peer may have
+            // already half-closed or gone away, in which case send()
+            // fails silently (return value ignored) and we close
+            // regardless. This is not an error in our logic, it's a
+            // race inherent to TCP; nothing to retry or recover.
+            const std::string body = "<h1>408 Request Timeout</h1>";
+            std::string response =
+                "HTTP/1.1 408 Request Timeout\r\n"
+                "Content-Type: text/html\r\n"
+                "Content-Length: " +
+                std::to_string(body.size()) + "\r\n"
+                                              "Connection: close\r\n"
+                                              "\r\n" +
+                body;
+            send(client_fd, response.c_str(), response.size(), 0);
+            break;
+        }
+
+        std::cout << raw << "\n";
+
+        auto request_line = parse_request_line(raw);
+
+        std::string body;
+        int status_code;
+        std::string status_text;
+        std::string content_type = "text/html"; // default; overridden for static files
+
+        if (!request_line)
+        {
+            body = "<h1>400 Bad Request</h1>";
+            status_code = 400;
+            status_text = "Bad Request";
+        }
+        else if (!has_header(raw, "host"))
+        {
+            body = "<h1>400 Bad Request</h1>";
+            status_code = 400;
+            status_text = "Bad Request";
+        }
+        else if (request_line->method != "GET" &&
+                 request_line->method != "POST" &&
+                 request_line->method != "HEAD")
+        {
+            body = "<h1>405 Method Not Allowed</h1>";
+            status_code = 405;
+            status_text = "Method Not Allowed";
+        }
+        else if (request_line->method == "POST" && !has_header(raw, "content-length"))
+        {
+            body = "<h1>411 Length Required</h1>";
+            status_code = 411;
+            status_text = "Length Required";
+        }
+        else
+        {
+            const std::string &path = request_line->path;
+            std::cout << "Path: " << path << "\n";
+
+            if (path == "/")
+            {
+                body = "<h1>Hello</h1>";
+                status_code = 200;
+                status_text = "OK";
+            }
+            else if (path == "/about")
+            {
+                body = "<h1>About Page</h1>";
+                status_code = 200;
+                status_text = "OK";
+            }
+            else
+            {
+                // Static file serving fallback. Reached only for paths
+                // that are not one of the hardcoded routes above.
+                //
+                // Traversal guard runs on the raw request path, before
+                // any disk path is constructed, and before the
+                // filesystem is touched at all. This is deliberate:
+                // correctness here must not depend on the OS refusing
+                // to open a path that escapes public_dir; it depends
+                // on never constructing or opening that path in the
+                // first place. Rejects "/foo..bar.html" too (a literal
+                // ".." substring in an otherwise normal filename) as a
+                // false positive; that tradeoff is accepted as the
+                // conservative side to err on.
+                if (path.find("..") != std::string::npos)
+                {
+                    body = "<h1>400 Bad Request</h1>";
+                    status_code = 400;
+                    status_text = "Bad Request";
+                }
+                else
+                {
+                    // path already starts with '/' (enforced by
+                    // parse_request_line), so this concatenation does
+                    // not need an extra separator.
+                    std::string disk_path = public_dir + path;
+
+                    std::ifstream file(disk_path, std::ios::binary);
+                    if (!file)
+                    {
+                        // Distinct from the hardcoded route-not-found
+                        // 404 above: this means "no such file on disk
+                        // under public_dir", not "no such route".
+                        body = "<h1>404 File Not Found</h1>";
+                        status_code = 404;
+                        status_text = "Not Found";
+                    }
+                    else
+                    {
+                        body.assign((std::istreambuf_iterator<char>(file)),
+                                    std::istreambuf_iterator<char>());
+                        status_code = 200;
+                        status_text = "OK";
+                        content_type = get_mime_type(path);
+                    }
+                }
+            }
+        }
+
+        bool is_head = request_line && request_line->method == "HEAD";
+
+        // has_header only confirms the Connection header is present,
+        // not its value, so the close-vs-keep-alive decision still
+        // needs an explicit value check here rather than going
+        // through has_header. This duplicates one lowercase pass over
+        // the headers (has_header already did one to check for
+        // presence of other headers), which is a known minor
+        // redundancy, not a correctness issue: both passes operate on
+        // the same immutable `raw` string and produce no side effects.
+        bool client_requested_close = false;
+        {
+            std::string headers = raw.substr(0, raw.find("\r\n\r\n"));
+            std::string lowered = headers;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                           [](unsigned char c)
+                           { return std::tolower(c); });
+            client_requested_close = lowered.find("\r\nconnection: close") != std::string::npos;
+        }
+
+        // Close on: explicit client request, OR any response where
+        // the server can no longer trust byte-boundary tracking on
+        // this connection. 400 means the request line itself didn't
+        // parse, so Content-Length math may never have run correctly.
+        // 411 means a POST body's length is unknown, so any bytes
+        // that follow in the buffer cannot be safely attributed to
+        // this request or the next one. Continuing to trust `leftover`
+        // after either case risks silently misparsing every subsequent
+        // request on this connection.
+        bool should_close = client_requested_close || status_code == 400 || status_code == 411;
+
+        std::string response =
+            "HTTP/1.1 " + std::to_string(status_code) + " " + status_text + "\r\n"
+                                                                            "Content-Type: " +
+            content_type + "\r\n"
+                           "Content-Length: " +
+            std::to_string(body.size()) + "\r\n"
+                                          "Connection: " +
+            (should_close ? "close" : "keep-alive") + "\r\n"
+                                                      "\r\n";
+
+        if (!is_head)
+        {
+            response += body;
+        }
+
+        send(client_fd, response.c_str(), response.size(), 0);
+
+        if (should_close)
+            break;
+    }
+
+    close(client_fd);
+}
+
 int main()
 {
-    // Resolved once at startup, not per-request. PROJECT_ROOT is injected
-    // by CMake at compile time (target_compile_definitions, set to
-    // CMAKE_SOURCE_DIR), so this is independent of the working directory
-    // the binary happens to be launched from. See handover doc note on
-    // why executable-relative (/proc/self/exe) resolution was rejected
-    // in favor of compile-time source-tree resolution for this project.
+    // Resolved once at startup, not per-request/per-connection.
+    // PROJECT_ROOT is injected by CMake at compile time
+    // (target_compile_definitions, set to CMAKE_SOURCE_DIR), so this is
+    // independent of the working directory the binary happens to be
+    // launched from.
     const std::string public_dir = std::string(PROJECT_ROOT) + "/public";
+
+    // NEW as of Week 2 / Day 6: thread pool constructed once before the
+    // accept loop. hardware_concurrency() is a starting point tied to
+    // the machine's actual core count, not a benchmarked-optimal value;
+    // this server's work is I/O-bound (blocking recv/send), so more
+    // threads than cores may well perform better once epoll removes the
+    // blocking-read constraint. Treat this as a tunable, not a final
+    // answer; the wrk benchmarking step is where this gets revisited.
+    //
+    // max_queue_size of 1000 is a placeholder starting point, not a
+    // load-tested figure. It exists so a queue-full condition is
+    // actually reachable and testable, and so memory growth under
+    // sustained overload is bounded rather than open-ended. Revisit
+    // alongside thread_count during benchmarking.
+    unsigned int thread_count = std::thread::hardware_concurrency();
+    ThreadPool pool(thread_count, /*max_queue_size=*/1000);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0)
@@ -220,7 +556,7 @@ int main()
         return 1;
     }
 
-    std::cout << "Listening on port 8080\n";
+    std::cout << "Listening on port 8080 with " << thread_count << " worker threads\n";
 
     while (true)
     {
@@ -231,197 +567,36 @@ int main()
             continue;
         }
 
-        struct timeval timeout;
-        timeout.tv_sec = 5;
-        timeout.tv_usec = 0;
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        // NEW as of Week 2 / Day 6: instead of running the connection
+        // handler inline on the main thread (which blocked accept() from
+        // servicing the next client until the current one finished), the
+        // connection is now handed to the worker pool as a task, and the
+        // main thread immediately loops back to accept() the next
+        // client. public_dir is captured by value (cheap, immutable,
+        // removes any cross-thread lifetime concern).
+        bool submitted = pool.try_submit([client_fd, public_dir]
+                                         { handle_connection(client_fd, public_dir); });
 
-        // Per-connection state. Declared here, outside the keep-alive loop,
-        // so it persists across multiple requests on the same connection.
-        std::string leftover;
-
-        while (true) // keep-alive loop: one iteration per request
+        if (!submitted)
         {
-            auto [raw, status] = read_request(client_fd, leftover);
-
-            if (status == ReadStatus::ClientClosed)
-                break; // peer already closed, nothing to send, tear down
-
-            if (status == ReadStatus::TimedOut)
-            {
-                // Send 408 before closing. Best-effort: the peer may have
-                // already half-closed or gone away, in which case send()
-                // fails silently (return value ignored) and we close
-                // regardless. This is not an error in our logic, it's a
-                // race inherent to TCP; nothing to retry or recover.
-                const std::string body = "<h1>408 Request Timeout</h1>";
-                std::string response =
-                    "HTTP/1.1 408 Request Timeout\r\n"
-                    "Content-Type: text/html\r\n"
-                    "Content-Length: " +
-                    std::to_string(body.size()) + "\r\n"
-                                                  "Connection: close\r\n"
-                                                  "\r\n" +
-                    body;
-                send(client_fd, response.c_str(), response.size(), 0);
-                break;
-            }
-
-            std::cout << raw << "\n";
-
-            auto request_line = parse_request_line(raw);
-
-            std::string body;
-            int status_code;
-            std::string status_text;
-            std::string content_type = "text/html"; // default; overridden for static files
-
-            if (!request_line)
-            {
-                body = "<h1>400 Bad Request</h1>";
-                status_code = 400;
-                status_text = "Bad Request";
-            }
-            else if (!has_header(raw, "host"))
-            {
-                body = "<h1>400 Bad Request</h1>";
-                status_code = 400;
-                status_text = "Bad Request";
-            }
-            else if (request_line->method != "GET" &&
-                     request_line->method != "POST" &&
-                     request_line->method != "HEAD")
-            {
-                body = "<h1>405 Method Not Allowed</h1>";
-                status_code = 405;
-                status_text = "Method Not Allowed";
-            }
-            else if (request_line->method == "POST" && !has_header(raw, "content-length"))
-            {
-                body = "<h1>411 Length Required</h1>";
-                status_code = 411;
-                status_text = "Length Required";
-            }
-            else
-            {
-                const std::string &path = request_line->path;
-                std::cout << "Path: " << path << "\n";
-
-                if (path == "/")
-                {
-                    body = "<h1>Hello</h1>";
-                    status_code = 200;
-                    status_text = "OK";
-                }
-                else if (path == "/about")
-                {
-                    body = "<h1>About Page</h1>";
-                    status_code = 200;
-                    status_text = "OK";
-                }
-                else
-                {
-                    // Static file serving fallback. Reached only for paths
-                    // that are not one of the hardcoded routes above.
-                    //
-                    // Traversal guard runs on the raw request path, before
-                    // any disk path is constructed, and before the
-                    // filesystem is touched at all. This is deliberate:
-                    // correctness here must not depend on the OS refusing
-                    // to open a path that escapes public_dir; it depends
-                    // on never constructing or opening that path in the
-                    // first place. Rejects "/foo..bar.html" too (a literal
-                    // ".." substring in an otherwise normal filename) as a
-                    // false positive; that tradeoff is accepted as the
-                    // conservative side to err on.
-                    if (path.find("..") != std::string::npos)
-                    {
-                        body = "<h1>400 Bad Request</h1>";
-                        status_code = 400;
-                        status_text = "Bad Request";
-                    }
-                    else
-                    {
-                        // path already starts with '/' (enforced by
-                        // parse_request_line), so this concatenation does
-                        // not need an extra separator.
-                        std::string disk_path = public_dir + path;
-
-                        std::ifstream file(disk_path, std::ios::binary);
-                        if (!file)
-                        {
-                            // Distinct from the hardcoded route-not-found
-                            // 404 above: this means "no such file on disk
-                            // under public_dir", not "no such route".
-                            body = "<h1>404 File Not Found</h1>";
-                            status_code = 404;
-                            status_text = "Not Found";
-                        }
-                        else
-                        {
-                            body.assign((std::istreambuf_iterator<char>(file)),
-                                        std::istreambuf_iterator<char>());
-                            status_code = 200;
-                            status_text = "OK";
-                            content_type = get_mime_type(path);
-                        }
-                    }
-                }
-            }
-
-            bool is_head = request_line && request_line->method == "HEAD";
-
-            // has_header only confirms the Connection header is present,
-            // not its value, so the close-vs-keep-alive decision still
-            // needs an explicit value check here rather than going
-            // through has_header. This duplicates one lowercase pass over
-            // the headers (has_header already did one to check for
-            // presence of other headers), which is a known minor
-            // redundancy, not a correctness issue: both passes operate on
-            // the same immutable `raw` string and produce no side effects.
-            bool client_requested_close = false;
-            {
-                std::string headers = raw.substr(0, raw.find("\r\n\r\n"));
-                std::string lowered = headers;
-                std::transform(lowered.begin(), lowered.end(), lowered.begin(),
-                               [](unsigned char c)
-                               { return std::tolower(c); });
-                client_requested_close = lowered.find("\r\nconnection: close") != std::string::npos;
-            }
-
-            // Close on: explicit client request, OR any response where
-            // the server can no longer trust byte-boundary tracking on
-            // this connection. 400 means the request line itself didn't
-            // parse, so Content-Length math may never have run correctly.
-            // 411 means a POST body's length is unknown, so any bytes
-            // that follow in the buffer cannot be safely attributed to
-            // this request or the next one (Open Issue #1). Continuing
-            // to trust `leftover` after either case risks silently
-            // misparsing every subsequent request on this connection.
-            bool should_close = client_requested_close || status_code == 400 || status_code == 411;
-
+            // Queue is full. Per explicit decision: send a real 503
+            // response before closing, rather than silently dropping
+            // the connection with no explanation. This happens on the
+            // main thread, not a worker, since the worker pool itself
+            // is what's overloaded; the main thread is otherwise idle
+            // at exactly this moment (it just finished accept()).
+            const std::string body = "<h1>503 Service Unavailable</h1>";
             std::string response =
-                "HTTP/1.1 " + std::to_string(status_code) + " " + status_text + "\r\n"
-                                                                                "Content-Type: " +
-                content_type + "\r\n"
-                               "Content-Length: " +
+                "HTTP/1.1 503 Service Unavailable\r\n"
+                "Content-Type: text/html\r\n"
+                "Content-Length: " +
                 std::to_string(body.size()) + "\r\n"
-                                              "Connection: " +
-                (should_close ? "close" : "keep-alive") + "\r\n"
-                                                          "\r\n";
-
-            if (!is_head)
-            {
-                response += body;
-            }
-
+                                              "Connection: close\r\n"
+                                              "\r\n" +
+                body;
             send(client_fd, response.c_str(), response.size(), 0);
-
-            if (should_close)
-                break;
+            close(client_fd);
         }
-
-        close(client_fd);
     }
 
     return 0;
