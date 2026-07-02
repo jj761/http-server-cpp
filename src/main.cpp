@@ -1,8 +1,9 @@
 #include "thread_pool.hpp"
 #include "server.hpp"
-
 #include <iostream>
 #include <thread>
+#include <cstring>
+#include <cerrno>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -18,7 +19,7 @@ int main()
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0)
     {
-        std::cerr << "socket() failed\n";
+        std::cerr << "socket() failed: " << strerror(errno) << "\n";
         return 1;
     }
 
@@ -35,13 +36,13 @@ int main()
 
     if (bind(server_fd, (sockaddr *)&addr, sizeof(addr)) < 0)
     {
-        std::cerr << "bind() failed\n";
+        std::cerr << "bind() failed: " << strerror(errno) << "\n";
         return 1;
     }
 
     if (listen(server_fd, 128) < 0)
     {
-        std::cerr << "listen() failed\n";
+        std::cerr << "listen() failed: " << strerror(errno) << "\n";
         return 1;
     }
 
