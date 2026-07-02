@@ -16,6 +16,7 @@ struct ConnectionState
     time_t last_active;
     bool closing;
     std::mutex connection_mutex;
+    bool dequeued = false;
 
     ConnectionState(int fd_, std::string public_dir_);
 };
