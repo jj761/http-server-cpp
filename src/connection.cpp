@@ -4,6 +4,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <sstream>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <unistd.h>
@@ -14,10 +15,24 @@
 std::unordered_map<int, std::shared_ptr<ConnectionState>> connections;
 std::mutex connections_map_mutex;
 
+// Shared log mutex, guards all std::cerr diagnostic writes across the
+// codebase. Distinct from connection_mutex and connections_map_mutex
+// so logging never contends with connection-state or map locking.
+std::mutex log_mutex;
+
+// Builds and writes one log line atomically. Callers must pass a
+// fully-assembled string (e.g. via std::ostringstream) rather than
+// chaining multiple operator<< calls directly on std::cerr, since
+// separate calls can interleave across threads.
+void log_line(const std::string &line)
+{
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::cerr << line;
+}
+
 ConnectionState::ConnectionState(int fd_, std::string public_dir_)
     : fd(fd_), public_dir(std::move(public_dir_)),
       last_active(time(nullptr)), closing(false) {}
-
 void close_connection(int epoll_fd, int fd)
 {
     std::shared_ptr<ConnectionState> conn;
@@ -39,7 +54,6 @@ void close_connection(int epoll_fd, int fd)
     std::lock_guard<std::mutex> map_lock(connections_map_mutex);
     connections.erase(fd);
 }
-
 ReadOutcome read_available(int fd, std::string &leftover,
                            std::vector<std::string> &out_messages)
 {
@@ -60,7 +74,6 @@ ReadOutcome read_available(int fd, std::string &leftover,
             out_messages.push_back(std::move(*msg));
     }
 }
-
 bool drain_output_locked(int epoll_fd, std::shared_ptr<ConnectionState> &conn)
 {
     while (!conn->out_buffer.empty())
@@ -70,16 +83,24 @@ bool drain_output_locked(int epoll_fd, std::shared_ptr<ConnectionState> &conn)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                std::cerr << "[epollout-register] fd=" << conn->fd
-                          << " remaining=" << conn->out_buffer.size() << "\n";
+                {
+                    std::ostringstream oss;
+                    oss << "[epollout-register] fd=" << conn->fd
+                        << " remaining=" << conn->out_buffer.size() << "\n";
+                    log_line(oss.str());
+                }
                 epoll_event ev{};
                 ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
                 ev.data.fd = conn->fd;
                 epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
                 return true;
             }
-            std::cerr << "[write-error] fd=" << conn->fd
-                      << " errno=" << strerror(errno) << "\n";
+            {
+                std::ostringstream oss;
+                oss << "[write-error] fd=" << conn->fd
+                    << " errno=" << strerror(errno) << "\n";
+                log_line(oss.str());
+            }
             return false;
         }
         conn->out_buffer.erase(0, n);
@@ -91,7 +112,6 @@ bool drain_output_locked(int epoll_fd, std::shared_ptr<ConnectionState> &conn)
     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
     return true;
 }
-
 bool try_write(int epoll_fd, std::shared_ptr<ConnectionState> conn, const std::string &data)
 {
     std::lock_guard<std::mutex> lock(conn->connection_mutex);

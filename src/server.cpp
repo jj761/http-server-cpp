@@ -3,6 +3,8 @@
 #include "thread_pool.hpp"
 #include "router.hpp"
 #include <iostream>
+#include <sstream>
+#include <mutex>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -13,6 +15,10 @@
 
 constexpr int QUEUE_TIMEOUT_SECONDS = 30;
 constexpr int IDLE_TIMEOUT_SECONDS = 5;
+
+// log_mutex and log_line() are declared in connection.hpp and defined
+// once in connection.cpp, shared across all translation units so every
+// std::cerr diagnostic write in the codebase goes through the same lock.
 
 void timeout_sweep(int epoll_fd, std::atomic<bool> &shutdown_flag)
 {
@@ -44,7 +50,11 @@ void timeout_sweep(int epoll_fd, std::atomic<bool> &shutdown_flag)
             }
             if (!timed_out)
                 continue;
-            std::cerr << "[idle-timeout] fd=" << fd << "\n";
+            {
+                std::ostringstream oss;
+                oss << "[idle-timeout] fd=" << fd << "\n";
+                log_line(oss.str());
+            }
             const std::string body = "<h1>408 Request Timeout</h1>";
             std::string response =
                 "HTTP/1.1 408 Request Timeout\r\n"
@@ -128,8 +138,12 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
 
             if (events[i].events & (EPOLLHUP | EPOLLERR))
             {
-                std::cerr << "[epollhup-err] fd=" << fd
-                          << " events=" << events[i].events << "\n";
+                {
+                    std::ostringstream oss;
+                    oss << "[epollhup-err] fd=" << fd
+                        << " events=" << events[i].events << "\n";
+                    log_line(oss.str());
+                }
                 close_connection(epoll_fd, fd);
                 continue;
             }
@@ -144,11 +158,19 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                 }
                 if (drain_failed)
                 {
-                    std::cerr << "[epollout-drain-failed] fd=" << fd << "\n";
+                    {
+                        std::ostringstream oss;
+                        oss << "[epollout-drain-failed] fd=" << fd << "\n";
+                        log_line(oss.str());
+                    }
                     close_connection(epoll_fd, fd);
                     continue;
                 }
-                std::cerr << "[epollout-fired] fd=" << fd << "\n";
+                {
+                    std::ostringstream oss;
+                    oss << "[epollout-fired] fd=" << fd << "\n";
+                    log_line(oss.str());
+                }
             }
 
             if (events[i].events & EPOLLIN)
@@ -160,14 +182,19 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                     if (conn->closing)
                         continue;
                     conn->last_active = time(nullptr);
+                    conn->dequeued = false;
                     outcome = read_available(fd, conn->leftover, messages);
                 }
 
                 if (outcome == ReadOutcome::ClientClosed || outcome == ReadOutcome::Error)
                 {
-                    std::cerr << "[read-outcome] fd=" << fd
-                              << " outcome=" << (outcome == ReadOutcome::ClientClosed ? "ClientClosed" : "Error")
-                              << "\n";
+                    {
+                        std::ostringstream oss;
+                        oss << "[read-outcome] fd=" << fd
+                            << " outcome=" << (outcome == ReadOutcome::ClientClosed ? "ClientClosed" : "Error")
+                            << "\n";
+                        log_line(oss.str());
+                    }
                     close_connection(epoll_fd, fd);
                     continue;
                 }
@@ -179,7 +206,11 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                                                      {
                         auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - enqueue_time).count();
-                        std::cerr << "[dequeue] fd=" << conn->fd << " wait_ms=" << wait_ms << "\n";
+                        {
+                            std::ostringstream oss;
+                            oss << "[dequeue] fd=" << conn->fd << " wait_ms=" << wait_ms << "\n";
+                            log_line(oss.str());
+                        }
                         {
                             std::lock_guard<std::mutex> lock(conn->connection_mutex);
                             conn->last_active = time(nullptr);
@@ -191,7 +222,11 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                             close_connection(epoll_fd, conn->fd); });
                     if (!submitted)
                     {
-                        std::cerr << "[queue-full] rejecting fd=" << fd << "\n";
+                        {
+                            std::ostringstream oss;
+                            oss << "[queue-full] rejecting fd=" << fd << "\n";
+                            log_line(oss.str());
+                        }
                         const std::string body = "<h1>503 Service Unavailable</h1>";
                         std::string response =
                             "HTTP/1.1 503 Service Unavailable\r\n"
