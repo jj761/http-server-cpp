@@ -5,6 +5,7 @@
 #include <iostream>
 #include <sstream>
 #include <mutex>
+#include <cstdlib>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -41,7 +42,9 @@ void timeout_sweep(int epoll_fd, std::atomic<bool> &shutdown_flag)
                 std::lock_guard<std::mutex> lock(conn->connection_mutex);
                 if (conn->closing)
                     continue;
-                int threshold = conn->dequeued ? IDLE_TIMEOUT_SECONDS : QUEUE_TIMEOUT_SECONDS;
+                if (conn->state == ConnState::InFlight)
+                    continue; // actively being processed, never subject to timeout
+                int threshold = (conn->state == ConnState::Queued) ? QUEUE_TIMEOUT_SECONDS : IDLE_TIMEOUT_SECONDS;
                 if (now - conn->last_active >= threshold)
                 {
                     timed_out = true;
@@ -182,7 +185,7 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                     if (conn->closing)
                         continue;
                     conn->last_active = time(nullptr);
-                    conn->dequeued = false;
+                    conn->state = ConnState::Queued;
                     outcome = read_available(fd, conn->leftover, messages);
                 }
 
@@ -214,10 +217,34 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                         {
                             std::lock_guard<std::mutex> lock(conn->connection_mutex);
                             conn->last_active = time(nullptr);
-                            conn->dequeued = true;
+                            conn->state = ConnState::InFlight;
                         }
+
+                        // TEST-ONLY — Issue A deterministic delay test. Remove after verification.
+                        // Triggers on: GET /__test_delay?seconds=N HTTP/1.1
+                        {
+                            auto marker = msg.find("/__test_delay");
+                            if (marker != std::string::npos)
+                            {
+                                int seconds = 10;
+                                auto line_end = msg.find(" HTTP/", marker);
+                                auto pos = msg.find("seconds=", marker);
+                                if (pos != std::string::npos && (line_end == std::string::npos || pos < line_end))
+                                    seconds = std::atoi(msg.c_str() + pos + 8);
+                                std::this_thread::sleep_for(std::chrono::seconds(seconds));
+                            }
+                        }
+
                         ProcessResult result = process_request(msg, conn->public_dir);
                         bool write_ok = try_write(epoll_fd, conn, result.response);
+                        {
+                            std::lock_guard<std::mutex> lock(conn->connection_mutex);
+                            if (!conn->closing)
+                            {
+                                conn->state = ConnState::Idle;
+                                conn->last_active = time(nullptr);
+                            }
+                        }
                         if (!write_ok || result.should_close)
                             close_connection(epoll_fd, conn->fd); });
                     if (!submitted)

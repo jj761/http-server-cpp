@@ -6,13 +6,12 @@
 #include <unordered_map>
 #include <ctime>
 
-// Shared diagnostic-logging primitives. All std::cerr-based log writes
-// across the codebase (server.cpp, connection.cpp) must go through
-// log_line() rather than writing to std::cerr directly, since chained
-// operator<< calls on a shared stream can interleave across threads.
-// Defined once in connection.cpp.
-extern std::mutex log_mutex;
-void log_line(const std::string &line);
+enum class ConnState
+{
+    Idle,
+    Queued,
+    InFlight
+};
 
 struct ConnectionState
 {
@@ -23,7 +22,7 @@ struct ConnectionState
     time_t last_active;
     bool closing;
     std::mutex connection_mutex;
-    bool dequeued = false;
+    ConnState state = ConnState::Idle; // replaces: bool dequeued = false;
     ConnectionState(int fd_, std::string public_dir_);
 };
 // Global connection table. Declared here, defined once in connection.cpp
@@ -51,3 +50,6 @@ bool drain_output_locked(int epoll_fd, std::shared_ptr<ConnectionState> &conn);
 // hard send() error, not on EAGAIN (deferred write, handled via
 // EPOLLOUT arming inside drain_output_locked).
 bool try_write(int epoll_fd, std::shared_ptr<ConnectionState> conn, const std::string &data);
+
+extern std::mutex log_mutex;
+void log_line(const std::string &line);
