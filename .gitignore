@@ -1,2 +1,4 @@
 build/
 public/
+*.log
+victim_output*.txt
