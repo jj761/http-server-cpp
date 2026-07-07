@@ -17,9 +17,15 @@ std::optional<RequestLine> parse_request_line(const std::string &request)
     if (path.empty() || path[0] != '/')
         return std::nullopt;
 
+    size_t line_end = request.find("\r\n", second_space + 1);
+    std::string version = (line_end == std::string::npos)
+                              ? request.substr(second_space + 1)
+                              : request.substr(second_space + 1, line_end - second_space - 1);
+
     RequestLine result;
     result.method = request.substr(0, first_space);
     result.path = path;
+    result.version = version;
     return result;
 }
 
@@ -35,6 +41,35 @@ bool has_header(const std::string &request, const std::string &lowercase_name)
                    { return std::tolower(c); });
 
     return headers.find("\r\n" + lowercase_name + ":") != std::string::npos;
+}
+
+std::optional<std::string> get_header_value(const std::string &request, const std::string &lowercase_name)
+{
+    size_t header_end = request.find("\r\n\r\n");
+    std::string headers = (header_end == std::string::npos)
+                              ? request
+                              : request.substr(0, header_end);
+
+    std::transform(headers.begin(), headers.end(), headers.begin(),
+                   [](unsigned char c)
+                   { return std::tolower(c); });
+
+    std::string marker = "\r\n" + lowercase_name + ":";
+    size_t pos = headers.find(marker);
+    if (pos == std::string::npos)
+        return std::nullopt;
+
+    size_t value_start = pos + marker.size();
+    size_t value_end = headers.find("\r\n", value_start);
+    if (value_end == std::string::npos)
+        value_end = headers.size();
+
+    while (value_start < value_end && std::isspace(static_cast<unsigned char>(headers[value_start])))
+        ++value_start;
+    while (value_end > value_start && std::isspace(static_cast<unsigned char>(headers[value_end - 1])))
+        --value_end;
+
+    return headers.substr(value_start, value_end - value_start);
 }
 
 bool ends_with(const std::string &path, const std::string &suffix)

@@ -2,8 +2,6 @@
 #include "http_parsing.hpp"
 
 #include <fstream>
-#include <algorithm>
-#include <cctype>
 
 ProcessResult process_request(const std::string &raw, const std::string &public_dir)
 {
@@ -88,17 +86,18 @@ ProcessResult process_request(const std::string &raw, const std::string &public_
 
     bool is_head = request_line && request_line->method == "HEAD";
 
-    bool client_requested_close = false;
-    {
-        std::string headers = raw.substr(0, raw.find("\r\n\r\n"));
-        std::string lowered = headers;
-        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
-                       [](unsigned char c)
-                       { return std::tolower(c); });
-        client_requested_close = lowered.find("\r\nconnection: close") != std::string::npos;
-    }
+    std::optional<std::string> connection_header = get_header_value(raw, "connection");
+    bool client_requested_close = connection_header == "close";
+    bool client_requested_keep_alive = connection_header == "keep-alive";
+    bool is_http_1_0 = request_line && request_line->version == "HTTP/1.0";
 
-    bool should_close = client_requested_close || status_code == 400 || status_code == 411;
+    bool should_close;
+    if (client_requested_close || status_code == 400 || status_code == 411)
+        should_close = true;
+    else if (is_http_1_0)
+        should_close = !client_requested_keep_alive;
+    else
+        should_close = false;
 
     std::string response =
         "HTTP/1.1 " + std::to_string(status_code) + " " + status_text + "\r\n"
