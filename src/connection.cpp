@@ -33,26 +33,27 @@ void log_line(const std::string &line)
 ConnectionState::ConnectionState(int fd_, std::string public_dir_)
     : fd(fd_), public_dir(std::move(public_dir_)),
       last_active(time(nullptr)), closing(false) {}
-void close_connection(int epoll_fd, int fd)
+
+void close_connection(int epoll_fd, const std::shared_ptr<ConnectionState> &conn)
 {
-    std::shared_ptr<ConnectionState> conn;
-    {
-        std::lock_guard<std::mutex> map_lock(connections_map_mutex);
-        auto it = connections.find(fd);
-        if (it == connections.end())
-            return;
-        conn = it->second;
-    }
     {
         std::lock_guard<std::mutex> lock(conn->connection_mutex);
         if (conn->closing)
+        {
             return;
+        }
         conn->closing = true;
+    }
+
+    int fd = conn->fd;
+    {
+        std::lock_guard<std::mutex> map_lock(connections_map_mutex);
+        auto it = connections.find(fd);
+        if (it != connections.end() && it->second.get() == conn.get())
+            connections.erase(it);
     }
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
-    std::lock_guard<std::mutex> map_lock(connections_map_mutex);
-    connections.erase(fd);
 }
 ReadOutcome read_available(int fd, std::string &leftover,
                            std::vector<std::string> &out_messages)

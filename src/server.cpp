@@ -68,7 +68,7 @@ void timeout_sweep(int epoll_fd, std::atomic<bool> &shutdown_flag)
                                               "\r\n" +
                 body;
             send(fd, response.c_str(), response.size(), 0);
-            close_connection(epoll_fd, fd);
+            close_connection(epoll_fd, conn);
         }
     }
 }
@@ -147,7 +147,7 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                         << " events=" << events[i].events << "\n";
                     log_line(oss.str());
                 }
-                close_connection(epoll_fd, fd);
+                close_connection(epoll_fd, conn);
                 continue;
             }
 
@@ -166,7 +166,7 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                         oss << "[epollout-drain-failed] fd=" << fd << "\n";
                         log_line(oss.str());
                     }
-                    close_connection(epoll_fd, fd);
+                    close_connection(epoll_fd, conn);
                     continue;
                 }
                 {
@@ -198,7 +198,7 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                             << "\n";
                         log_line(oss.str());
                     }
-                    close_connection(epoll_fd, fd);
+                    close_connection(epoll_fd, conn);
                     continue;
                 }
 
@@ -246,7 +246,7 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                             }
                         }
                         if (!write_ok || result.should_close)
-                            close_connection(epoll_fd, conn->fd); });
+                            close_connection(epoll_fd, conn); });
                     if (!submitted)
                     {
                         {
@@ -264,7 +264,7 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                                                           "\r\n" +
                             body;
                         try_write(epoll_fd, conn, response);
-                        close_connection(epoll_fd, fd);
+                        close_connection(epoll_fd, conn);
                     }
                 }
             }

@@ -31,9 +31,16 @@ extern std::unordered_map<int, std::shared_ptr<ConnectionState>> connections;
 extern std::mutex connections_map_mutex;
 // Single teardown funnel for a connection, callable from any thread,
 // for any reason (read error, client close, write error, timeout).
-// Uses ConnectionState::closing under connection_mutex to guarantee
-// only one caller executes the epoll_ctl/close/erase sequence per fd.
-void close_connection(int epoll_fd, int fd);
+//
+// Takes the caller's own shared_ptr<ConnectionState>, not a raw fd. This
+// is required for correctness: the closing check runs on the object the
+// caller actually holds, under its own connection_mutex, BEFORE any map
+// lookup by fd number. Passing a bare int fd here would reopen a fd-reuse
+// race (Issue G) where a stale caller's fd number could have already been
+// reassigned by the OS to an unrelated, live connection -- an fd-keyed
+// lookup can't tell the difference, but checking closing on the caller's
+// own object first can.
+void close_connection(int epoll_fd, const std::shared_ptr<ConnectionState> &conn);
 enum class ReadOutcome
 {
     ClientClosed,
