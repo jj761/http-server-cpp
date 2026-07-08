@@ -10,7 +10,15 @@ enum class ConnState
 {
     Idle,
     Queued,
-    InFlight
+    InFlight,
+    Draining // process_request done, out_buffer not fully drained, backpressured on EPOLLOUT
+};
+
+enum class DrainResult
+{
+    Complete, // out_buffer fully drained
+    Pending,  // partial drain, EAGAIN/EWOULDBLOCK, re-armed for EPOLLOUT
+    Failed    // hard send() error
 };
 
 struct ConnectionState
@@ -25,10 +33,12 @@ struct ConnectionState
     ConnState state = ConnState::Idle; // replaces: bool dequeued = false;
     ConnectionState(int fd_, std::string public_dir_);
 };
+
 // Global connection table. Declared here, defined once in connection.cpp
 // (see note below on why this must NOT be defined in the header).
 extern std::unordered_map<int, std::shared_ptr<ConnectionState>> connections;
 extern std::mutex connections_map_mutex;
+
 // Single teardown funnel for a connection, callable from any thread,
 // for any reason (read error, client close, write error, timeout).
 //
@@ -41,22 +51,30 @@ extern std::mutex connections_map_mutex;
 // lookup can't tell the difference, but checking closing on the caller's
 // own object first can.
 void close_connection(int epoll_fd, const std::shared_ptr<ConnectionState> &conn);
+
 enum class ReadOutcome
 {
     ClientClosed,
     Error,
     Drained
 };
+
 // Edge-triggered read drain. Loops internally until EAGAIN. May
 // deliver zero, one, or multiple complete messages per call.
 ReadOutcome read_available(int fd, std::string &leftover,
                            std::vector<std::string> &out_messages);
+
 // Caller must already hold conn->connection_mutex.
-bool drain_output_locked(int epoll_fd, std::shared_ptr<ConnectionState> &conn);
-// Appends to out_buffer and attempts a drain. Returns false only on a
-// hard send() error, not on EAGAIN (deferred write, handled via
-// EPOLLOUT arming inside drain_output_locked).
-bool try_write(int epoll_fd, std::shared_ptr<ConnectionState> conn, const std::string &data);
+// Returns Complete (buffer empty), Pending (EAGAIN, re-armed for EPOLLOUT,
+// not a failure), or Failed (hard send() error).
+DrainResult drain_output_locked(int epoll_fd, std::shared_ptr<ConnectionState> &conn);
+
+// Appends to out_buffer and attempts a drain. Returns Failed only on a
+// hard send() error. Complete and Pending both indicate the write was
+// accepted -- caller must check which to know whether out_buffer is
+// actually empty (Pending means it is not, and EPOLLOUT is now armed
+// to finish the drain later).
+DrainResult try_write(int epoll_fd, std::shared_ptr<ConnectionState> conn, const std::string &data);
 
 extern std::mutex log_mutex;
 void log_line(const std::string &line);

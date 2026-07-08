@@ -44,7 +44,6 @@ void close_connection(int epoll_fd, const std::shared_ptr<ConnectionState> &conn
         }
         conn->closing = true;
     }
-
     int fd = conn->fd;
     {
         std::lock_guard<std::mutex> map_lock(connections_map_mutex);
@@ -55,6 +54,7 @@ void close_connection(int epoll_fd, const std::shared_ptr<ConnectionState> &conn
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
 }
+
 ReadOutcome read_available(int fd, std::string &leftover,
                            std::vector<std::string> &out_messages)
 {
@@ -75,7 +75,8 @@ ReadOutcome read_available(int fd, std::string &leftover,
             out_messages.push_back(std::move(*msg));
     }
 }
-bool drain_output_locked(int epoll_fd, std::shared_ptr<ConnectionState> &conn)
+
+DrainResult drain_output_locked(int epoll_fd, std::shared_ptr<ConnectionState> &conn)
 {
     while (!conn->out_buffer.empty())
     {
@@ -94,7 +95,7 @@ bool drain_output_locked(int epoll_fd, std::shared_ptr<ConnectionState> &conn)
                 ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
                 ev.data.fd = conn->fd;
                 epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
-                return true;
+                return DrainResult::Pending;
             }
             {
                 std::ostringstream oss;
@@ -102,7 +103,7 @@ bool drain_output_locked(int epoll_fd, std::shared_ptr<ConnectionState> &conn)
                     << " errno=" << strerror(errno) << "\n";
                 log_line(oss.str());
             }
-            return false;
+            return DrainResult::Failed;
         }
         conn->out_buffer.erase(0, n);
         conn->last_active = time(nullptr);
@@ -111,13 +112,14 @@ bool drain_output_locked(int epoll_fd, std::shared_ptr<ConnectionState> &conn)
     ev.events = EPOLLIN | EPOLLET;
     ev.data.fd = conn->fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
-    return true;
+    return DrainResult::Complete;
 }
-bool try_write(int epoll_fd, std::shared_ptr<ConnectionState> conn, const std::string &data)
+
+DrainResult try_write(int epoll_fd, std::shared_ptr<ConnectionState> conn, const std::string &data)
 {
     std::lock_guard<std::mutex> lock(conn->connection_mutex);
     if (conn->closing)
-        return true;
+        return DrainResult::Complete;
     conn->out_buffer += data;
     return drain_output_locked(epoll_fd, conn);
 }

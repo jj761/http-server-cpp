@@ -16,6 +16,11 @@
 
 constexpr int QUEUE_TIMEOUT_SECONDS = 30;
 constexpr int IDLE_TIMEOUT_SECONDS = 5;
+// [Guessing] — not derived from a measured slow-client model, only checked
+// against the Day 15 Step 4 repro (200KB/s throttle, 10MB file, observed
+// register->fired gaps of ~14.7s and ~7.9s). Revisit if Issue E or real
+// traffic shows this is wrong in either direction.
+constexpr int DRAINING_TIMEOUT_SECONDS = 30;
 
 // log_mutex and log_line() are declared in connection.hpp and defined
 // once in connection.cpp, shared across all translation units so every
@@ -44,7 +49,13 @@ void timeout_sweep(int epoll_fd, std::atomic<bool> &shutdown_flag)
                     continue;
                 if (conn->state == ConnState::InFlight)
                     continue; // actively being processed, never subject to timeout
-                int threshold = (conn->state == ConnState::Queued) ? QUEUE_TIMEOUT_SECONDS : IDLE_TIMEOUT_SECONDS;
+                int threshold;
+                if (conn->state == ConnState::Queued)
+                    threshold = QUEUE_TIMEOUT_SECONDS;
+                else if (conn->state == ConnState::Draining)
+                    threshold = DRAINING_TIMEOUT_SECONDS;
+                else
+                    threshold = IDLE_TIMEOUT_SECONDS;
                 if (now - conn->last_active >= threshold)
                 {
                     timed_out = true;
@@ -153,13 +164,18 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
 
             if (events[i].events & EPOLLOUT)
             {
-                bool drain_failed = false;
+                DrainResult drain_result = DrainResult::Complete; // no-op if closing
                 {
                     std::lock_guard<std::mutex> lock(conn->connection_mutex);
                     if (!conn->closing)
-                        drain_failed = !drain_output_locked(epoll_fd, conn);
+                    {
+                        drain_result = drain_output_locked(epoll_fd, conn);
+                        if (drain_result == DrainResult::Complete)
+                            conn->state = ConnState::Idle;
+                        // Pending: leave as Draining, no assignment needed
+                    }
                 }
-                if (drain_failed)
+                if (drain_result == DrainResult::Failed)
                 {
                     {
                         std::ostringstream oss;
@@ -236,16 +252,18 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                         }
 
                         ProcessResult result = process_request(msg, conn->public_dir);
-                        bool write_ok = try_write(epoll_fd, conn, result.response);
+                        DrainResult drain_result = try_write(epoll_fd, conn, result.response);
                         {
                             std::lock_guard<std::mutex> lock(conn->connection_mutex);
                             if (!conn->closing)
                             {
-                                conn->state = ConnState::Idle;
+                                conn->state = (drain_result == DrainResult::Pending)
+                                                   ? ConnState::Draining
+                                                   : ConnState::Idle;
                                 conn->last_active = time(nullptr);
                             }
                         }
-                        if (!write_ok || result.should_close)
+                        if (drain_result == DrainResult::Failed || result.should_close)
                             close_connection(epoll_fd, conn); });
                     if (!submitted)
                     {
