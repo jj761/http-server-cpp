@@ -101,12 +101,21 @@ std::optional<std::string> try_extract_message(std::string &buffer)
         return std::nullopt;
 
     size_t content_length = 0;
-    std::string cl_header = "Content-Length: ";
-    size_t cl_pos = buffer.find(cl_header);
-    if (cl_pos != std::string::npos && cl_pos < header_end)
+    auto cl_value = get_header_value(buffer, "content-length");
+    if (cl_value)
     {
-        size_t cl_end = buffer.find("\r\n", cl_pos);
-        content_length = std::stoul(buffer.substr(cl_pos + cl_header.size(), cl_end - cl_pos - cl_header.size()));
+        try
+        {
+            size_t parsed_chars = 0;
+            unsigned long parsed = std::stoul(*cl_value, &parsed_chars);
+            if (parsed_chars != cl_value->size())
+                return std::nullopt; // trailing garbage, e.g. "5abc" -- treat as malformed
+            content_length = parsed;
+        }
+        catch (const std::exception &)
+        {
+            return std::nullopt; // non-numeric value -- treat as malformed, don't crash
+        }
     }
 
     size_t message_end = header_end + 4 + content_length;

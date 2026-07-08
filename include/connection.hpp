@@ -3,7 +3,9 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <unordered_map>
+#include <cstdint>
 #include <ctime>
 
 enum class ConnState
@@ -11,14 +13,14 @@ enum class ConnState
     Idle,
     Queued,
     InFlight,
-    Draining // process_request done, out_buffer not fully drained, backpressured on EPOLLOUT
+    Draining
 };
 
 enum class DrainResult
 {
-    Complete, // out_buffer fully drained
-    Pending,  // partial drain, EAGAIN/EWOULDBLOCK, re-armed for EPOLLOUT
-    Failed    // hard send() error
+    Complete,
+    Pending,
+    Failed
 };
 
 struct ConnectionState
@@ -31,25 +33,25 @@ struct ConnectionState
     bool closing;
     std::mutex connection_mutex;
     ConnState state = ConnState::Idle; // replaces: bool dequeued = false;
+
+    // Per-connection pipelined-batch ordering. A "batch" is the set of
+    // messages extracted from a single read event. next_extract_seq is
+    // assigned once per batch at extraction time; next_write_seq gates
+    // batches so they process/write strictly in the order they were
+    // extracted, even if their underlying tasks run on different worker
+    // threads and would otherwise race. write_turn_cv wakes a waiting
+    // batch either when the batch ahead of it finishes, or when the
+    // connection is closed from any code path (see close_connection).
+    uint64_t next_extract_seq = 0;
+    uint64_t next_write_seq = 0;
+    std::condition_variable write_turn_cv;
+
     ConnectionState(int fd_, std::string public_dir_);
 };
 
-// Global connection table. Declared here, defined once in connection.cpp
-// (see note below on why this must NOT be defined in the header).
 extern std::unordered_map<int, std::shared_ptr<ConnectionState>> connections;
 extern std::mutex connections_map_mutex;
 
-// Single teardown funnel for a connection, callable from any thread,
-// for any reason (read error, client close, write error, timeout).
-//
-// Takes the caller's own shared_ptr<ConnectionState>, not a raw fd. This
-// is required for correctness: the closing check runs on the object the
-// caller actually holds, under its own connection_mutex, BEFORE any map
-// lookup by fd number. Passing a bare int fd here would reopen a fd-reuse
-// race (Issue G) where a stale caller's fd number could have already been
-// reassigned by the OS to an unrelated, live connection -- an fd-keyed
-// lookup can't tell the difference, but checking closing on the caller's
-// own object first can.
 void close_connection(int epoll_fd, const std::shared_ptr<ConnectionState> &conn);
 
 enum class ReadOutcome
@@ -59,21 +61,11 @@ enum class ReadOutcome
     Drained
 };
 
-// Edge-triggered read drain. Loops internally until EAGAIN. May
-// deliver zero, one, or multiple complete messages per call.
 ReadOutcome read_available(int fd, std::string &leftover,
                            std::vector<std::string> &out_messages);
 
-// Caller must already hold conn->connection_mutex.
-// Returns Complete (buffer empty), Pending (EAGAIN, re-armed for EPOLLOUT,
-// not a failure), or Failed (hard send() error).
 DrainResult drain_output_locked(int epoll_fd, std::shared_ptr<ConnectionState> &conn);
 
-// Appends to out_buffer and attempts a drain. Returns Failed only on a
-// hard send() error. Complete and Pending both indicate the write was
-// accepted -- caller must check which to know whether out_buffer is
-// actually empty (Pending means it is not, and EPOLLOUT is now armed
-// to finish the drain later).
 DrainResult try_write(int epoll_fd, std::shared_ptr<ConnectionState> conn, const std::string &data);
 
 extern std::mutex log_mutex;

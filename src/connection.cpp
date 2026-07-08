@@ -44,6 +44,11 @@ void close_connection(int epoll_fd, const std::shared_ptr<ConnectionState> &conn
         }
         conn->closing = true;
     }
+    // Wake any batch task blocked waiting for its write turn on this
+    // connection -- otherwise a task waiting behind a batch that never
+    // finishes (because the connection was closed out from under it by
+    // the idle-timeout sweep or an error path) would block forever.
+    conn->write_turn_cv.notify_all();
     int fd = conn->fd;
     {
         std::lock_guard<std::mutex> map_lock(connections_map_mutex);

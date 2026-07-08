@@ -218,53 +218,94 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                     continue;
                 }
 
-                for (auto &msg : messages)
+                // Issue "pipelined response ordering": all messages extracted from this
+                // single read event are submitted as ONE task and processed sequentially
+                // inside it, not one task per message. This guarantees in-order responses
+                // for messages that arrive together in one read (the demonstrated bug
+                // case). It does NOT guarantee ordering across messages split over two
+                // separate epoll read events on the same connection -- that residual gap
+                // is untouched by this fix and would need a per-connection sequence/gate
+                // mechanism to close fully.
+                if (!messages.empty())
                 {
+                    uint64_t batch_seq;
+                    {
+                        std::lock_guard<std::mutex> lock(conn->connection_mutex);
+                        batch_seq = conn->next_extract_seq++;
+                    }
                     auto enqueue_time = std::chrono::steady_clock::now();
-                    bool submitted = pool.try_submit([epoll_fd, conn, msg = std::move(msg), enqueue_time]() mutable
+                    bool submitted = pool.try_submit([epoll_fd, conn, messages = std::move(messages), enqueue_time, batch_seq]() mutable
                                                      {
-                        auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - enqueue_time).count();
-                        {
-                            std::ostringstream oss;
-                            oss << "[dequeue] fd=" << conn->fd << " wait_ms=" << wait_ms << "\n";
-                            log_line(oss.str());
-                        }
-                        {
-                            std::lock_guard<std::mutex> lock(conn->connection_mutex);
-                            conn->last_active = time(nullptr);
-                            conn->state = ConnState::InFlight;
-                        }
+        // Enforce strict per-connection FIFO ordering: don't process or
+        // write anything for this batch until every earlier-extracted
+        // batch on this same connection has finished. Different
+        // connections are entirely unaffected by this wait.
+        {
+            std::unique_lock<std::mutex> lock(conn->connection_mutex);
+            conn->write_turn_cv.wait(lock, [&] {
+                return conn->closing || conn->next_write_seq == batch_seq;
+            });
+            if (conn->closing)
+            {
+                lock.unlock();
+                conn->write_turn_cv.notify_all();
+                return;
+            }
+        }
 
-                        // TEST-ONLY — Issue A deterministic delay test. Remove after verification.
-                        // Triggers on: GET /__test_delay?seconds=N HTTP/1.1
-                        {
-                            auto marker = msg.find("/__test_delay");
-                            if (marker != std::string::npos)
-                            {
-                                int seconds = 10;
-                                auto line_end = msg.find(" HTTP/", marker);
-                                auto pos = msg.find("seconds=", marker);
-                                if (pos != std::string::npos && (line_end == std::string::npos || pos < line_end))
-                                    seconds = std::atoi(msg.c_str() + pos + 8);
-                                std::this_thread::sleep_for(std::chrono::seconds(seconds));
-                            }
-                        }
+        for (auto &msg : messages)
+        {
+            auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - enqueue_time).count();
+            {
+                std::ostringstream oss;
+                oss << "[dequeue] fd=" << conn->fd << " wait_ms=" << wait_ms << "\n";
+                log_line(oss.str());
+            }
+            {
+                std::lock_guard<std::mutex> lock(conn->connection_mutex);
+                conn->last_active = time(nullptr);
+                conn->state = ConnState::InFlight;
+            }
 
-                        ProcessResult result = process_request(msg, conn->public_dir);
-                        DrainResult drain_result = try_write(epoll_fd, conn, result.response);
-                        {
-                            std::lock_guard<std::mutex> lock(conn->connection_mutex);
-                            if (!conn->closing)
-                            {
-                                conn->state = (drain_result == DrainResult::Pending)
-                                                   ? ConnState::Draining
-                                                   : ConnState::Idle;
-                                conn->last_active = time(nullptr);
-                            }
-                        }
-                        if (drain_result == DrainResult::Failed || result.should_close)
-                            close_connection(epoll_fd, conn); });
+            // TEST-ONLY — Issue A deterministic delay test. Remove after verification.
+            {
+                auto marker = msg.find("/__test_delay");
+                if (marker != std::string::npos)
+                {
+                    int seconds = 10;
+                    auto line_end = msg.find(" HTTP/", marker);
+                    auto pos = msg.find("seconds=", marker);
+                    if (pos != std::string::npos && (line_end == std::string::npos || pos < line_end))
+                        seconds = std::atoi(msg.c_str() + pos + 8);
+                    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+                }
+            }
+
+            ProcessResult result = process_request(msg, conn->public_dir);
+            DrainResult drain_result = try_write(epoll_fd, conn, result.response);
+            {
+                std::lock_guard<std::mutex> lock(conn->connection_mutex);
+                if (!conn->closing)
+                {
+                    conn->state = (drain_result == DrainResult::Pending)
+                                       ? ConnState::Draining
+                                       : ConnState::Idle;
+                    conn->last_active = time(nullptr);
+                }
+            }
+            if (drain_result == DrainResult::Failed || result.should_close)
+            {
+                close_connection(epoll_fd, conn);
+                break;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(conn->connection_mutex);
+            conn->next_write_seq = batch_seq + 1;
+        }
+        conn->write_turn_cv.notify_all(); });
                     if (!submitted)
                     {
                         {
