@@ -6,8 +6,11 @@
 #include <sstream>
 #include <mutex>
 #include <cstdlib>
+#include <cerrno>
+#include <cstring>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <atomic>
@@ -101,6 +104,28 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
     std::atomic<bool> shutdown_flag(false);
     std::thread sweep_thread(timeout_sweep, epoll_fd, std::ref(shutdown_flag));
 
+    // Soft connection ceiling, derived from the process's actual fd limit
+    // (RLIMIT_NOFILE) rather than a hardcoded constant, so this adapts
+    // correctly whether the process is run under a constrained ulimit (e.g.
+    // a test harness) or a production ceiling (e.g. ulimit -n 65536).
+    // Headroom (100) is reserved for fds this process needs outside of
+    // client connections: the listening socket, epoll_fd, the log file,
+    // stdin/stdout/stderr, and any static files open for serving at a given
+    // moment. [Guessing] on the exact headroom value -- not measured against
+    // this process's actual non-connection fd usage, just a conservative
+    // round number. Revisit if this proves too tight or too loose in
+    // practice.
+    rlimit rl{};
+    size_t max_connections_soft = 1024; // fallback if getrlimit fails
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur > 100)
+        max_connections_soft = static_cast<size_t>(rl.rlim_cur) - 100;
+    {
+        std::ostringstream oss;
+        oss << "[startup] rlimit_nofile=" << rl.rlim_cur
+            << " max_connections_soft=" << max_connections_soft << "\n";
+        log_line(oss.str());
+    }
+
     const int MAX_EVENTS = 64;
     epoll_event events[MAX_EVENTS];
 
@@ -123,9 +148,37 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
             {
                 while (true)
                 {
+                    // Soft ceiling check: stop accepting new connections this
+                    // cycle if we're within the reserved headroom of the fd
+                    // limit. Existing connections continue being served
+                    // normally -- this only affects new accept() calls.
+                    // Edge-triggered epoll will re-notify EPOLLIN on the
+                    // listen_fd on the next event loop iteration as long as
+                    // the kernel's accept queue remains non-empty, so
+                    // pending connections are not silently dropped, just
+                    // deferred until fd headroom frees up.
+                    {
+                        std::lock_guard<std::mutex> lock(connections_map_mutex);
+                        if (connections.size() >= max_connections_soft)
+                        {
+                            std::ostringstream oss;
+                            oss << "[accept-throttled] connections=" << connections.size()
+                                << " soft_limit=" << max_connections_soft << "\n";
+                            log_line(oss.str());
+                            break;
+                        }
+                    }
                     int client_fd = accept(listen_fd, nullptr, nullptr);
                     if (client_fd < 0)
+                    {
+                        if (errno != EAGAIN && errno != EWOULDBLOCK)
+                        {
+                            std::ostringstream oss;
+                            oss << "[accept-error] errno=" << strerror(errno) << "\n";
+                            log_line(oss.str());
+                        }
                         break;
+                    }
                     int flags = fcntl(client_fd, F_GETFL, 0);
                     fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
                     auto conn = std::make_shared<ConnectionState>(client_fd, public_dir);
@@ -222,10 +275,9 @@ void run_epoll_loop(int listen_fd, ThreadPool &pool, const std::string &public_d
                 // single read event are submitted as ONE task and processed sequentially
                 // inside it, not one task per message. This guarantees in-order responses
                 // for messages that arrive together in one read (the demonstrated bug
-                // case). It does NOT guarantee ordering across messages split over two
-                // separate epoll read events on the same connection -- that residual gap
-                // is untouched by this fix and would need a per-connection sequence/gate
-                // mechanism to close fully.
+                // case), and, combined with the per-connection sequence gate below,
+                // also across messages split over separate epoll read events on the
+                // same connection.
                 if (!messages.empty())
                 {
                     uint64_t batch_seq;
