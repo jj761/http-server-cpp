@@ -1,8 +1,7 @@
 # http-server-cpp
 
-A production-shaped HTTP/1.1 server written from scratch in C++, on raw POSIX sockets and Linux epoll. No Boost.Asio, no libuv, no existing HTTP framework — the socket lifecycle, the protocol parser, the concurrency model, and the backpressure handling are all hand-written.
+A production-shaped HTTP/1.1 server written from scratch in C++, on raw POSIX sockets and Linux epoll. No Boost.Asio, no libuv, no existing HTTP framework the socket lifecycle, the protocol parser, the concurrency model, and the backpressure handling are all hand-written.
 
-This isn't a toy that handles the happy path. Every claim below is backed by a live reproduction: the broken behavior was captured first, then the fix, then the fix was re-verified against the same test.
 
 ---
 
@@ -26,8 +25,6 @@ This isn't a toy that handles the happy path. Every claim below is backed by a l
 - No compression (gzip/br).
 - No HTTP/2.
 - No range requests (no resumable downloads, no video seeking).
-
-This is a correctness- and concurrency-focused HTTP/1.1 engine, not a general-purpose production web server. If you want to actually host something with it, static content only, and put a real reverse proxy (nginx, Caddy) in front for TLS.
 
 ---
 
