@@ -40,15 +40,12 @@ ProcessResult process_request(const std::string &raw, const std::string &public_
     }
     else
     {
-        const std::string &path = request_line->path;
+        std::string path = request_line->path;
 
         if (path == "/")
-        {
-            body = "<h1>Hello</h1>";
-            status_code = 200;
-            status_text = "OK";
-        }
-        else if (path == "/about")
+            path = "/index.html";
+
+        if (path == "/about")
         {
             body = "<h1>About Page</h1>";
             status_code = 200;

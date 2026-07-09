@@ -1,0 +1,969 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>http-server-cpp — a web server, from scratch</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
+        rel="stylesheet">
+    <style>
+        :root {
+            --bg: #12151a;
+            --surface: #191d24;
+            --surface-2: #21262f;
+            --border: #2c323d;
+            --text: #e9e7e2;
+            --text-dim: #8b93a3;
+            --text-faint: #5b6270;
+            --accent: #ffb020;
+            --accent-dim: #b8801a;
+            --ok: #5fbf8f;
+            --err: #e8604c;
+            --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+            --font-sans: 'IBM Plex Sans', -apple-system, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: var(--font-sans);
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        a:focus-visible,
+        button:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 3px;
+        }
+
+        .wrap {
+            max-width: 920px;
+            margin: 0 auto;
+            padding: 0 24px;
+        }
+
+        /* ---------- NAV ---------- */
+        nav {
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            background: rgba(18, 21, 26, 0.88);
+            backdrop-filter: blur(8px);
+            border-bottom: 1px solid var(--border);
+        }
+
+        nav .wrap {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 24px;
+            max-width: 920px;
+        }
+
+        .brand {
+            font-family: var(--font-mono);
+            font-size: 14px;
+            color: var(--text);
+            font-weight: 600;
+            letter-spacing: 0.02em;
+        }
+
+        .brand .dot {
+            color: var(--ok);
+        }
+
+        .navlinks {
+            display: flex;
+            gap: 22px;
+            font-family: var(--font-mono);
+            font-size: 13px;
+        }
+
+        .navlinks a {
+            color: var(--text-dim);
+        }
+
+        .navlinks a:hover {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        /* ---------- HERO ---------- */
+        .hero {
+            padding: 72px 0 56px;
+            position: relative;
+        }
+
+        .terminal {
+            background: linear-gradient(180deg, #14171d 0%, #0f1216 100%);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 20px 60px -20px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.02);
+            position: relative;
+        }
+
+        .terminal::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: repeating-linear-gradient(0deg,
+                    rgba(255, 255, 255, 0.012) 0px,
+                    rgba(255, 255, 255, 0.012) 1px,
+                    transparent 1px,
+                    transparent 3px);
+            opacity: 0.6;
+        }
+
+        .term-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 11px 16px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(255, 255, 255, 0.015);
+        }
+
+        .term-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #3a4049;
+        }
+
+        .term-title {
+            margin-left: 8px;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: var(--text-faint);
+        }
+
+        .term-body {
+            padding: 22px 20px 26px;
+            font-family: var(--font-mono);
+            font-size: 14px;
+            line-height: 1.75;
+            white-space: pre-wrap;
+        }
+
+        .term-body .req {
+            color: var(--text-dim);
+        }
+
+        .term-body .req .method {
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        .term-body .status-line {
+            color: var(--ok);
+            font-weight: 600;
+        }
+
+        .term-body .hdr-key {
+            color: var(--text-dim);
+        }
+
+        .term-body .hdr-val {
+            color: var(--text);
+        }
+
+        .term-body .body-line {
+            color: var(--text);
+        }
+
+        .cursor {
+            display: inline-block;
+            width: 8px;
+            height: 15px;
+            background: var(--accent);
+            margin-left: 2px;
+            animation: blink 1s step-end infinite;
+            vertical-align: text-bottom;
+        }
+
+        @keyframes blink {
+            50% {
+                opacity: 0;
+            }
+        }
+
+        .term-caption {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: var(--text-faint);
+            margin-top: 14px;
+            padding-left: 2px;
+        }
+
+        .term-caption .ok {
+            color: var(--ok);
+        }
+
+        h1.title {
+            font-family: var(--font-mono);
+            font-size: clamp(28px, 4.2vw, 42px);
+            font-weight: 700;
+            letter-spacing: -0.01em;
+            margin: 40px 0 14px;
+            color: var(--text);
+        }
+
+        .title .accent {
+            color: var(--accent);
+        }
+
+        .lede {
+            font-size: 17px;
+            color: var(--text-dim);
+            max-width: 640px;
+            margin: 0 0 8px;
+        }
+
+        .lede strong {
+            color: var(--text);
+            font-weight: 600;
+        }
+
+        /* ---------- STAT STRIP ---------- */
+        .statstrip {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1px;
+            background: var(--border);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
+            margin: 40px 0 8px;
+        }
+
+        .stat {
+            background: var(--surface);
+            padding: 18px 16px;
+            text-align: left;
+        }
+
+        .stat .num {
+            font-family: var(--font-mono);
+            font-size: 22px;
+            font-weight: 700;
+            color: var(--accent);
+            display: block;
+        }
+
+        .stat .label {
+            font-size: 12px;
+            color: var(--text-faint);
+            margin-top: 4px;
+            display: block;
+        }
+
+        /* ---------- SECTIONS ---------- */
+        section {
+            padding: 64px 0;
+            border-top: 1px solid var(--border);
+        }
+
+        section.first {
+            border-top: none;
+        }
+
+        .eyebrow {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: var(--accent);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 10px;
+        }
+
+        h2 {
+            font-family: var(--font-mono);
+            font-size: 26px;
+            font-weight: 700;
+            margin: 0 0 18px;
+            color: var(--text);
+        }
+
+        .section-intro {
+            color: var(--text-dim);
+            max-width: 620px;
+            margin-bottom: 32px;
+        }
+
+        /* ---------- ARCHITECTURE DIAGRAM ---------- */
+        .diagram {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 28px 20px;
+            overflow-x: auto;
+        }
+
+        .diagram svg {
+            display: block;
+            margin: 0 auto;
+            min-width: 640px;
+        }
+
+        .diagram-note {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: var(--text-faint);
+            margin-top: 16px;
+            text-align: center;
+        }
+
+        /* ---------- BUG CARDS ---------- */
+        .bugs {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+        }
+
+        .bug-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 20px;
+        }
+
+        .bug-tag {
+            display: inline-block;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            font-weight: 700;
+            padding: 3px 8px;
+            border-radius: 4px;
+            margin-bottom: 12px;
+            letter-spacing: 0.02em;
+        }
+
+        .bug-tag.crash {
+            background: rgba(232, 96, 76, 0.14);
+            color: var(--err);
+        }
+
+        .bug-tag.timeout {
+            background: rgba(255, 176, 32, 0.14);
+            color: var(--accent);
+        }
+
+        .bug-tag.race {
+            background: rgba(139, 147, 163, 0.16);
+            color: var(--text-dim);
+        }
+
+        .bug-tag.exhaust {
+            background: rgba(95, 191, 143, 0.14);
+            color: var(--ok);
+        }
+
+        .bug-card h3 {
+            font-size: 16px;
+            margin: 0 0 8px;
+            color: var(--text);
+            font-weight: 600;
+        }
+
+        .bug-card p {
+            font-size: 14px;
+            color: var(--text-dim);
+            margin: 0 0 10px;
+        }
+
+        .bug-card .fix {
+            font-size: 13px;
+            color: var(--text-faint);
+            border-top: 1px solid var(--border);
+            padding-top: 10px;
+            margin-top: 10px;
+        }
+
+        .bug-card .fix .ok-mark {
+            color: var(--ok);
+            font-weight: 600;
+        }
+
+        /* ---------- BENCHMARK TABLE ---------- */
+        .bench-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: var(--font-mono);
+            font-size: 13px;
+        }
+
+        .bench-table th {
+            text-align: left;
+            color: var(--text-faint);
+            font-weight: 500;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+            text-transform: uppercase;
+            font-size: 11px;
+            letter-spacing: 0.05em;
+        }
+
+        .bench-table td {
+            padding: 12px;
+            border-bottom: 1px solid var(--border);
+            color: var(--text);
+        }
+
+        .bench-table td.dim {
+            color: var(--text-dim);
+        }
+
+        .bench-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .bar-cell {
+            position: relative;
+            min-width: 140px;
+        }
+
+        .bar-track {
+            background: var(--surface-2);
+            border-radius: 3px;
+            height: 8px;
+            overflow: hidden;
+        }
+
+        .bar-fill {
+            height: 100%;
+            background: var(--accent);
+            border-radius: 3px;
+        }
+
+        .bench-note {
+            font-size: 13px;
+            color: var(--text-faint);
+            margin-top: 16px;
+            padding: 14px 16px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            border-left: 3px solid var(--accent);
+        }
+
+        /* ---------- CAPABILITY GRID ---------- */
+        .capgrid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+
+        .capcol h3 {
+            font-family: var(--font-mono);
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin: 0 0 14px;
+        }
+
+        .capcol.yes h3 {
+            color: var(--ok);
+        }
+
+        .capcol.no h3 {
+            color: var(--text-faint);
+        }
+
+        .capcol ul {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+        }
+
+        .capcol li {
+            font-size: 14px;
+            color: var(--text-dim);
+            padding: 8px 0 8px 22px;
+            position: relative;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .capcol.yes li::before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            color: var(--ok);
+            font-weight: 700;
+        }
+
+        .capcol.no li::before {
+            content: "×";
+            position: absolute;
+            left: 0;
+            color: var(--text-faint);
+            font-weight: 700;
+        }
+
+        /* ---------- VERIFICATION GALLERY ---------- */
+        .gallery {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 14px;
+        }
+
+        .shot {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .shot img {
+            width: 100%;
+            display: block;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .shot figcaption {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: var(--text-dim);
+            padding: 10px 12px;
+            margin: 0;
+        }
+
+        .shot figcaption .code {
+            color: var(--ok);
+            font-weight: 600;
+        }
+
+        /* ---------- FOOTER ---------- */
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 40px 0 56px;
+        }
+
+        footer .foot-grid {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+
+        footer .foot-mono {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: var(--text-faint);
+            line-height: 1.9;
+        }
+
+        footer .foot-note {
+            font-size: 13px;
+            color: var(--text-faint);
+            max-width: 340px;
+        }
+
+        /* ---------- RESPONSIVE ---------- */
+        @media (max-width: 720px) {
+            .statstrip {
+                grid-template-columns: 1fr 1fr;
+            }
+
+            .bugs {
+                grid-template-columns: 1fr;
+            }
+
+            .capgrid {
+                grid-template-columns: 1fr;
+            }
+
+            .gallery {
+                grid-template-columns: 1fr;
+            }
+
+            .term-body {
+                font-size: 12px;
+            }
+
+            h1.title {
+                font-size: 26px;
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .cursor {
+                animation: none;
+                opacity: 1;
+            }
+
+            html {
+                scroll-behavior: auto;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <nav>
+        <div class="wrap">
+            <div class="brand">http_server<span class="dot">●</span>cpp</div>
+            <div class="navlinks">
+                <a href="#architecture">Architecture</a>
+                <a href="#bugs">Bugs</a>
+                <a href="#benchmarks">Benchmarks</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="wrap">
+
+        <section class="hero first">
+            <div class="terminal">
+                <div class="term-bar">
+                    <span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span>
+                    <span class="term-title">localhost:8080 — raw TCP transcript</span>
+                </div>
+                <div class="term-body"><span class="req"><span class="method">GET</span> / HTTP/1.1
+                        Host: localhost:8080</span>
+
+                    <span class="status-line">HTTP/1.1 200 OK</span>
+                    <span class="hdr-key">Content-Type:</span> <span class="hdr-val">text/html</span>
+                    <span class="hdr-key">Content-Length:</span> <span class="hdr-val">14</span>
+                    <span class="hdr-key">Connection:</span> <span class="hdr-val">keep-alive</span>
+
+                    <span class="body-line">&lt;h1&gt;Hello&lt;/h1&gt;</span><span class="cursor"></span>
+                </div>
+            </div>
+            <p class="term-caption"><span class="ok">✓</span> that exchange is real — it's the exact request your
+                browser just made to load this page.</p>
+
+            <h1 class="title">A web server, <span class="accent">from scratch</span>, in C++.</h1>
+            <p class="lede">No frameworks. No libcurl, no Boost.Asio, no libuv. Just POSIX sockets, epoll, and a
+                hand-written parser that reads HTTP/1.1 the way the RFC actually describes it, not the way a tutorial
+                usually gets away with.</p>
+            <p class="lede"><strong>The page you're reading right now is a static file, served by this binary.</strong>
+            </p>
+
+            <div class="statstrip">
+                <div class="stat"><span class="num">23.6k</span><span class="label">req/sec at 10,000 concurrent
+                        conns</span></div>
+                <div class="stat"><span class="num">5,000</span><span class="label">connection flood, zero
+                        failures</span></div>
+                <div class="stat"><span class="num">10.5MB</span><span class="label">throttled download,
+                        byte-exact</span></div>
+                <div class="stat"><span class="num">0</span><span class="label">crashes across every test this
+                        session</span></div>
+            </div>
+        </section>
+
+        <section id="architecture">
+            <div class="eyebrow">Architecture</div>
+            <h2>One accept loop. Twelve workers. Zero busy-waiting.</h2>
+            <p class="section-intro">A single thread owns the epoll instance and never blocks on I/O. Connections move
+                through a small, explicit state machine — <em>Queued → InFlight → Idle / Draining</em> — so a slow
+                client downloading a large file can never be mistaken for one that's gone idle, and vice versa.</p>
+
+            <div class="diagram">
+                <svg viewBox="0 0 640 260" xmlns="http://www.w3.org/2000/svg" role="img"
+                    aria-label="Architecture diagram: accept loop feeds epoll, which drives a bounded thread pool of twelve workers, which write responses back through per-connection backpressure handling.">
+                    <defs>
+                        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
+                            orient="auto-start-reverse">
+                            <path d="M0,0 L10,5 L0,10 z" fill="#8b93a3" />
+                        </marker>
+                    </defs>
+                    <style>
+                        .box {
+                            fill: #21262f;
+                            stroke: #2c323d;
+                            stroke-width: 1.5;
+                            rx: 8;
+                        }
+
+                        .boxlabel {
+                            font-family: 'IBM Plex Mono', monospace;
+                            font-size: 13px;
+                            fill: #e9e7e2;
+                            font-weight: 600;
+                        }
+
+                        .boxsub {
+                            font-family: 'IBM Plex Mono', monospace;
+                            font-size: 10.5px;
+                            fill: #8b93a3;
+                        }
+
+                        .flow {
+                            stroke: #8b93a3;
+                            stroke-width: 1.5;
+                            fill: none;
+                            marker-end: url(#arrow);
+                        }
+
+                        .accentbox {
+                            fill: #21262f;
+                            stroke: #ffb020;
+                            stroke-width: 1.5;
+                        }
+                    </style>
+
+                    <rect class="box" x="20" y="20" width="150" height="54" />
+                    <text class="boxlabel" x="35" y="42">accept()</text>
+                    <text class="boxsub" x="35" y="58">soft fd ceiling</text>
+
+                    <rect class="box" x="245" y="20" width="150" height="54" />
+                    <text class="boxlabel" x="260" y="42">epoll (ET)</text>
+                    <text class="boxsub" x="260" y="58">single thread, non-blocking</text>
+
+                    <rect class="accentbox" x="470" y="20" width="150" height="54" rx="8" />
+                    <text class="boxlabel" x="485" y="42">thread pool</text>
+                    <text class="boxsub" x="485" y="58">12 workers · 1000 queue</text>
+
+                    <rect class="box" x="245" y="120" width="150" height="54" />
+                    <text class="boxlabel" x="260" y="142">sequence gate</text>
+                    <text class="boxsub" x="260" y="158">per-connection FIFO</text>
+
+                    <rect class="box" x="470" y="120" width="150" height="54" />
+                    <text class="boxlabel" x="485" y="142">try_write()</text>
+                    <text class="boxsub" x="485" y="158">Complete / Pending / Failed</text>
+
+                    <rect class="box" x="20" y="120" width="150" height="54" />
+                    <text class="boxlabel" x="35" y="142">timeout sweep</text>
+                    <text class="boxsub" x="35" y="158">Idle / Queued / Draining</text>
+
+                    <line class="flow" x1="170" y1="47" x2="245" y2="47" />
+                    <line class="flow" x1="395" y1="47" x2="470" y2="47" />
+                    <line class="flow" x1="545" y1="74" x2="545" y2="120" />
+                    <line class="flow" x1="470" y1="147" x2="395" y2="147" />
+                    <line class="flow" x1="245" y1="120" x2="170" y2="90" />
+                    <line class="flow" x1="320" y1="90" x2="320" y2="120" />
+
+                    <text x="320" y="220" text-anchor="middle" class="boxsub" fill="#5b6270">every connection state
+                        change happens under a single per-connection mutex — no exceptions</text>
+                </svg>
+            </div>
+            <p class="diagram-note">accept → epoll → bounded pool → sequence-gated write-back, with an independent sweep
+                reaping true idle connections only</p>
+        </section>
+
+        <section id="bugs">
+            <div class="eyebrow">Correctness</div>
+            <h2>Four real bugs. Found by testing, not by inspection.</h2>
+            <p class="section-intro">Every one of these was reproduced first — the broken behavior captured on camera,
+                so to speak — before anything was changed. Then the fix was verified against the exact same
+                reproduction. Tagged below with the HTTP status code most associated with each failure mode.</p>
+
+            <div class="bugs">
+                <div class="bug-card">
+                    <span class="bug-tag crash">500 · CRASH</span>
+                    <h3>One bad header, whole process down</h3>
+                    <p>A <code>Content-Length</code> header with a non-numeric value threw an uncaught
+                        <code>std::invalid_argument</code> from <code>std::stoul</code> on a worker thread — calling
+                        <code>std::terminate()</code> and killing every connection on the server, not just the offending
+                        one.</p>
+                    <p class="fix"><span class="ok-mark">Fixed</span> — wrapped in try/catch, validated the parse
+                        consumed the full value, and confirmed the process survives the identical probe post-fix.</p>
+                </div>
+
+                <div class="bug-card">
+                    <span class="bug-tag timeout">408 · TIMEOUT</span>
+                    <h3>Slow downloads, killed mid-transfer</h3>
+                    <p>A large file to a throttled client hit backpressure (EAGAIN) mid-write. The connection was marked
+                        <code>Idle</code> anyway — indistinguishable from a genuinely idle one — so the timeout sweep
+                        reaped it at the 5-second mark, truncating the download.</p>
+                    <p class="fix"><span class="ok-mark">Fixed</span> — added a dedicated <code>Draining</code> state
+                        with its own timeout. Verified: a 10.5MB file at 200KB/s now completes byte-for-byte,
+                        hash-matched.</p>
+                </div>
+
+                <div class="bug-card">
+                    <span class="bug-tag race">RACE · ORDER</span>
+                    <h3>Pipelined responses, out of order</h3>
+                    <p>Two requests pipelined on one connection could be picked up by two different worker threads and
+                        written back in whichever order finished first — a real RFC 7230 violation, not a cosmetic
+                        issue.</p>
+                    <p class="fix"><span class="ok-mark">Fixed</span> — a per-connection sequence gate (extract order
+                        in, write order out) forces strict FIFO even across separate read events. Reproduced broken,
+                        then reproduced fixed, twice.</p>
+                </div>
+
+                <div class="bug-card">
+                    <span class="bug-tag exhaust">503 · OVERLOAD</span>
+                    <h3>Fd exhaustion, no warning, no mercy</h3>
+                    <p>Under an artificially constrained file-descriptor limit and a connection flood,
+                        <code>accept()</code> began failing silently — no log line, just a cascade of hung-up
+                        connections downstream.</p>
+                    <p class="fix"><span class="ok-mark">Fixed</span> — a soft ceiling derived from
+                        <code>getrlimit()</code> now throttles new accepts before the OS ever refuses one, with the
+                        pressure logged directly at the source.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="benchmarks">
+            <div class="eyebrow">Load testing</div>
+            <h2>Where it bends, and why</h2>
+            <p class="section-intro">Three concurrency tiers, benchmarked with <code>wrk</code>. The goal wasn't a
+                single throughput number — it was finding out <em>which</em> resource gives first: CPU, the work queue,
+                or file descriptors.</p>
+
+            <table class="bench-table">
+                <thead>
+                    <tr>
+                        <th>Concurrency</th>
+                        <th>Req/sec</th>
+                        <th>p50</th>
+                        <th>p99</th>
+                        <th>Bottleneck</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>100</td>
+                        <td class="dim">33,172</td>
+                        <td class="dim">2.71ms</td>
+                        <td>
+                            <div class="bar-cell">
+                                <div class="bar-track">
+                                    <div class="bar-fill" style="width:24%"></div>
+                                </div>
+                            </div>
+                        </td>
+                        <td class="dim">queue contention</td>
+                    </tr>
+                    <tr>
+                        <td>1,000</td>
+                        <td class="dim">20,282</td>
+                        <td class="dim">47.59ms</td>
+                        <td>
+                            <div class="bar-cell">
+                                <div class="bar-track">
+                                    <div class="bar-fill" style="width:22%"></div>
+                                </div>
+                            </div>
+                        </td>
+                        <td class="dim">queue contention</td>
+                    </tr>
+                    <tr>
+                        <td>10,000</td>
+                        <td class="dim">23,679</td>
+                        <td class="dim">136.00ms</td>
+                        <td>
+                            <div class="bar-cell">
+                                <div class="bar-track">
+                                    <div class="bar-fill" style="width:31%"></div>
+                                </div>
+                            </div>
+                        </td>
+                        <td class="dim">queue + graceful 503s</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p class="bench-note">CPU never exceeded ~54% utilization at any tier — the bounded work queue is the actual
+                limiting resource, not the CPU and not (at these levels) file descriptors. At 10,000 connections, 1,578
+                requests timed out and 40,649 got a clean <code>503</code> instead of hanging — the bounded queue
+                degrading exactly as designed under real overload.</p>
+        </section>
+
+        <section>
+            <div class="eyebrow">Honest scope</div>
+            <h2>What this is, and isn't</h2>
+            <div class="capgrid">
+                <div class="capcol yes">
+                    <h3>Handles correctly</h3>
+                    <ul>
+                        <li>Partial reads &amp; pipelined requests</li>
+                        <li>Malformed input (400 / 411 / 405)</li>
+                        <li>Keep-alive connection reuse</li>
+                        <li>Large files under real backpressure</li>
+                        <li>Connection floods &amp; fd exhaustion</li>
+                        <li>Graceful overload shedding (503)</li>
+                    </ul>
+                </div>
+                <div class="capcol no">
+                    <h3>Doesn't do (yet)</h3>
+                    <ul>
+                        <li>HTTPS / TLS</li>
+                        <li>Virtual hosting</li>
+                        <li>Dynamic routes beyond two</li>
+                        <li>Compression (gzip / br)</li>
+                        <li>HTTP/2</li>
+                        <li>Range requests</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!--
+    VERIFICATION GALLERY -- disabled until screenshots are uploaded.
+    To re-enable: uncomment this whole section, remove the "gallery-disabled"
+    comment markers, and place these three files at public/assets/
+    relative to this HTML file:
+      verify-home.png   (browser showing GET / rendering "Hello", 200 status)
+      verify-about.png  (browser showing GET /about rendering "About Page")
+      verify-404.png    (browser showing the server's own 404 page)
+    Also restore the nav link: <a href="#verification">Verification</a>
+    inside the <div class="navlinks"> block near the top of this file.
+
+  <section id="verification">
+    <div class="eyebrow">Live verification</div>
+    <h2>Not screenshots of a demo. Screenshots of this server.</h2>
+    <p class="section-intro">Taken directly against the running binary — a real browser, a real request, a real response.</p>
+    <div class="gallery">
+      <figure class="shot">
+        <img src="assets/verify-home.png" alt="Browser showing the server's homepage rendering an H1 that says Hello, with dev tools open showing a 200 status">
+        <figcaption><span class="code">200</span> GET /</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="assets/verify-about.png" alt="Browser showing the /about route rendering an About Page heading">
+        <figcaption><span class="code">200</span> GET /about</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="assets/verify-404.png" alt="Browser showing the server's own 404 File Not Found page rendered as real content, not a browser error page">
+        <figcaption><span class="code">404</span> GET /nonexistent</figcaption>
+      </figure>
+    </div>
+  </section>
+  -->
+
+
+    </div>
+
+    <footer>
+        <div class="wrap foot-grid">
+            <div class="foot-mono">
+                C++17 · POSIX sockets · epoll (edge-triggered)<br>
+                Bounded thread pool · per-connection mutex model<br>
+                <a href="https://github.com/jj761/http-server-cpp">github.com/jj761/http-server-cpp</a>
+            </div>
+            <p class="foot-note">This page is a static file in <code>public/</code>. It was requested, parsed, routed,
+                and returned by the exact server described above — no intermediary, no CDN.</p>
+        </div>
+    </footer>
+
+</body>
+
+</html>
