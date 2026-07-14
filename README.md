@@ -28,6 +28,44 @@ A production-shaped HTTP/1.1 server written from scratch in C++, on raw POSIX so
 
 ---
 
+## Preview
+
+The landing page itself — served by this binary at `localhost:8080`, not a mockup.
+
+![Hero section with live TCP transcript and headline stats](docs/preview-hero.png)
+
+![Architecture diagram — accept loop, epoll, bounded thread pool](docs/preview-architecture.png)
+
+![Four real bugs found and fixed, with reproduction notes](docs/preview-bugs.png)
+
+![Load testing table across three concurrency tiers](docs/preview-benchmarks.png)
+
+![Honest scope — what the server handles and what it doesn't](docs/preview-scope.png)
+
+## Verification
+
+Not staged screenshots — the browser's own Network panel, showing the address bar, the actual request, and the response headers returned by the running binary.
+
+### `GET /` → `200 OK`
+
+![GET / returns 200](docs/verify-home.png)
+
+`Content-Type: text/html`, `Content-Length: 14`, `Connection: keep-alive` — the exact response transcribed at the top of this README.
+
+### `GET /about` → `200 OK`
+
+![GET /about returns 200](docs/verify-about.png)
+
+Second hardcoded route, served independently: `Content-Length: 19`, same connection reuse.
+
+### `GET /nonexistent` → `404 Not Found`
+
+![GET /nonexistent returns 404](docs/verify-404.png)
+
+Unmatched routes return a real `404` response (`Content-Length: 27`) — not a browser-generated error page, not a hang.
+
+---
+
 ## Architecture
 
 ```
@@ -163,4 +201,7 @@ include/
   *.hpp               corresponding headers
 public/
   index.html          this project's own portfolio page, served by itself
+docs/
+  preview-*.png       screenshots of the landing page (hero, architecture, bugs, benchmarks, scope)
+  verify-*.png        Network-panel screenshots proving the live server serves each route
 ```
